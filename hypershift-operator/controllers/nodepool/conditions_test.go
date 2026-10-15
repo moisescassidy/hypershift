@@ -23,6 +23,7 @@ import (
 
 	"sigs.k8s.io/cluster-api/api/core/v1beta2"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/blang/semver"
@@ -867,6 +868,174 @@ func TestConfigUpdatePendingCondition(t *testing.T) {
 			g.Expect(condition).NotTo(BeNil())
 			g.Expect(condition.Status).To(Equal(tc.expectedStatus))
 			g.Expect(condition.Reason).To(Equal(tc.expectedReason))
+		})
+	}
+}
+
+func TestSetMachineAndNodeConditionsBelowAutoscalingMinimum(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	namespace := "default"
+	clusterName := "test-cluster"
+	nodePoolName := "np-one"
+	nodePoolKey := namespace + "/" + nodePoolName
+	controlPlaneNamespace := namespace + "-" + clusterName
+
+	newNodePool := func(autoscaling *hyperv1.NodePoolAutoScaling) *hyperv1.NodePool {
+		return &hyperv1.NodePool{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      nodePoolName,
+				Namespace: namespace,
+			},
+			Spec: hyperv1.NodePoolSpec{
+				ClusterName: clusterName,
+				AutoScaling: autoscaling,
+			},
+		}
+	}
+
+	newMachine := func(name string, ready bool) *v1beta2.Machine {
+		m := &v1beta2.Machine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: controlPlaneNamespace,
+				Annotations: map[string]string{
+					nodePoolAnnotation: nodePoolKey,
+				},
+			},
+			Status: v1beta2.MachineStatus{},
+		}
+		if ready {
+			m.Status.Conditions = []metav1.Condition{
+				{
+					Type:   v1beta2.ReadyCondition,
+					Status: metav1.ConditionTrue,
+				},
+				{
+					Type:   v1beta2.MachineNodeHealthyCondition,
+					Status: metav1.ConditionTrue,
+				},
+			}
+		}
+		return m
+	}
+
+	newHostedCluster := func() *hyperv1.HostedCluster {
+		return &hyperv1.HostedCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterName,
+				Namespace: namespace,
+			},
+			Spec: hyperv1.HostedClusterSpec{
+				Networking: hyperv1.ClusterNetworking{},
+			},
+		}
+	}
+
+	testCases := []struct {
+		name                    string
+		numMachines             int
+		autoscaling             *hyperv1.NodePoolAutoScaling
+		expectBelowMin          bool
+		expectConditionReasons  map[hyperv1.ConditionType]string
+	}{
+		{
+			name:          "autoscaling enabled with fewer machines than min reports BelowAutoscalingMinimum",
+			numMachines:   1,
+			autoscaling:   &hyperv1.NodePoolAutoScaling{Min: ptr.To[int32](2), Max: 3},
+			expectBelowMin: true,
+			expectConditionReasons: map[hyperv1.ConditionType]string{
+				hyperv1.NodePoolAllMachinesReadyConditionType: hyperv1.BelowAutoscalingMinimumReason,
+				hyperv1.NodePoolAllNodesHealthyConditionType:  hyperv1.BelowAutoscalingMinimumReason,
+				hyperv1.NodePoolReadyConditionType:            hyperv1.BelowAutoscalingMinimumReason,
+			},
+		},
+		{
+			name:          "autoscaling enabled with machines at min does not report BelowAutoscalingMinimum",
+			numMachines:   2,
+			autoscaling:   &hyperv1.NodePoolAutoScaling{Min: ptr.To[int32](2), Max: 3},
+			expectBelowMin: false,
+		},
+		{
+			name:          "autoscaling enabled with more machines than min does not report BelowAutoscalingMinimum",
+			numMachines:   3,
+			autoscaling:   &hyperv1.NodePoolAutoScaling{Min: ptr.To[int32](2), Max: 3},
+			expectBelowMin: false,
+		},
+		{
+			name:          "autoscaling not enabled does not report BelowAutoscalingMinimum",
+			numMachines:   1,
+			autoscaling:   nil,
+			expectBelowMin: false,
+		},
+		{
+			name:          "autoscaling min=0 does not report BelowAutoscalingMinimum",
+			numMachines:   0,
+			autoscaling:   &hyperv1.NodePoolAutoScaling{Min: ptr.To[int32](0), Max: 3},
+			expectBelowMin: false,
+		},
+		{
+			name:          "autoscaling enabled with zero machines and min>0 reports BelowAutoscalingMinimum",
+			numMachines:   0,
+			autoscaling:   &hyperv1.NodePoolAutoScaling{Min: ptr.To[int32](2), Max: 3},
+			expectBelowMin: true,
+			expectConditionReasons: map[hyperv1.ConditionType]string{
+				hyperv1.NodePoolAllMachinesReadyConditionType: hyperv1.BelowAutoscalingMinimumReason,
+				hyperv1.NodePoolAllNodesHealthyConditionType:  hyperv1.BelowAutoscalingMinimumReason,
+				hyperv1.NodePoolReadyConditionType:            hyperv1.BelowAutoscalingMinimumReason,
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			nodePool := newNodePool(tc.autoscaling)
+
+			var machines []client.Object
+			for i := 0; i < tc.numMachines; i++ {
+				machines = append(machines, newMachine(fmt.Sprintf("machine-%d", i), true))
+			}
+
+			hostedCluster := newHostedCluster()
+
+			client := fake.NewClientBuilder().
+				WithScheme(api.Scheme).
+				WithObjects(nodePool, hostedCluster).
+				WithObjects(machines...).
+				Build()
+
+			r := &NodePoolReconciler{
+				Client: client,
+			}
+
+			err := r.setMachineAndNodeConditions(ctx, nodePool, hostedCluster)
+			g.Expect(err).To(BeNil())
+
+			if tc.expectBelowMin {
+				for condType, expectedReason := range tc.expectConditionReasons {
+					condition := FindStatusCondition(nodePool.Status.Conditions, string(condType))
+					g.Expect(condition).NotTo(BeNil(), "condition %s should be set", condType)
+					g.Expect(condition.Status).To(Equal(corev1.ConditionFalse), "condition %s should be False", condType)
+					g.Expect(condition.Reason).To(Equal(expectedReason), "condition %s should have reason %s", condType, expectedReason)
+				}
+			} else {
+				// When not below min, none of the conditions should have BelowAutoscalingMinimum reason
+				for _, condType := range []hyperv1.ConditionType{
+					hyperv1.NodePoolAllMachinesReadyConditionType,
+					hyperv1.NodePoolAllNodesHealthyConditionType,
+					hyperv1.NodePoolReadyConditionType,
+				} {
+					condition := FindStatusCondition(nodePool.Status.Conditions, string(condType))
+					if condition != nil {
+						g.Expect(condition.Reason).NotTo(Equal(hyperv1.BelowAutoscalingMinimumReason),
+							"condition %s should not have BelowAutoscalingMinimum reason", condType)
+					}
+				}
+			}
 		})
 	}
 }
