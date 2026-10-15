@@ -148,4 +148,8 @@ const (
 	AWSResourceTagConflictDetectedReason  = "TagConflictDetected"
 	AWSResourceTagNoConflictReason        = "NoTagConflict"
 	ManagementConfigDriftReason           = "ManagementConfigDrift"
+	// BelowAutoscalingMinimumReason is used when the NodePool has fewer machines
+	// than the configured autoScaling.min. The pool cannot be considered Ready
+	// or AllMachinesReady until it has at least min machines.
+	BelowAutoscalingMinimumReason         = "BelowAutoscalingMinimum"
 )

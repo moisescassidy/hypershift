@@ -685,6 +685,39 @@ func (r *NodePoolReconciler) setMachineAndNodeConditions(ctx context.Context, no
 
 	r.setAllNodesHealthyCondition(nodePool, machines)
 
+	// When autoscaling is enabled and the pool has fewer machines than the
+	// configured autoScaling.min, override the ready conditions so the pool is
+	// not misreported as "All is well" while below its own minimum. This
+	// surfaces the undersized state as a clear condition reason instead of
+	// hiding it behind a stale Ready=True / AllMachinesReady=True.
+	if isAutoscalingEnabled(nodePool) {
+		minReplicas := ptr.Deref(nodePool.Spec.AutoScaling.Min, 0)
+		if minReplicas > 0 && len(machines) < int(minReplicas) {
+			msg := fmt.Sprintf("NodePool has %d machine(s), below autoscaling minimum of %d", len(machines), minReplicas)
+			SetStatusCondition(&nodePool.Status.Conditions, hyperv1.NodePoolCondition{
+				Type:               hyperv1.NodePoolAllMachinesReadyConditionType,
+				Status:             corev1.ConditionFalse,
+				Reason:             hyperv1.BelowAutoscalingMinimumReason,
+				Message:            msg,
+				ObservedGeneration: nodePool.Generation,
+			})
+			SetStatusCondition(&nodePool.Status.Conditions, hyperv1.NodePoolCondition{
+				Type:               hyperv1.NodePoolAllNodesHealthyConditionType,
+				Status:             corev1.ConditionFalse,
+				Reason:             hyperv1.BelowAutoscalingMinimumReason,
+				Message:            msg,
+				ObservedGeneration: nodePool.Generation,
+			})
+			SetStatusCondition(&nodePool.Status.Conditions, hyperv1.NodePoolCondition{
+				Type:               hyperv1.NodePoolReadyConditionType,
+				Status:             corev1.ConditionFalse,
+				Reason:             hyperv1.BelowAutoscalingMinimumReason,
+				Message:            msg,
+				ObservedGeneration: nodePool.Generation,
+			})
+		}
+	}
+
 	err = r.setCIDRConflictCondition(ctx, nodePool, machines, hc)
 	if err != nil {
 		return err
